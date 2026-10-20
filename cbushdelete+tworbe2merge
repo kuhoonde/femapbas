@@ -50,7 +50,7 @@
 
 Option Explicit
 
-Const PREVIEW_ONLY As Boolean = Falsh
+Const PREVIEW_ONLY As Boolean = False
 Const OUTPUT_DEPENDENT_DOFS As String = "123456"
 Const PROGRESS_INTERVAL_SECONDS As Double = 5#
 Const PROGRESS_EVERY_ITEMS As Long = 100
