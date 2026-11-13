@@ -1,0 +1,168 @@
+Option Explicit
+' rbe2/3을 순차적으로 선택하면 중심노드를 판별하고 선택한 순서대로 cbush가 연결
+' Run in the Femap API Programming window.
+' Pick an existing Spring/Damper property with Type = CBUSH, then its orientation CSys.
+' Pick one RBE2 or RBE3 per dialog, in order. Cancel the final pick to create the chain.
+
+Sub Main()
+    Const ScriptTitle As String = "Connect RBE2/RBE3 with CBUSH"
+    Const OrientByCSys As Long = 5  ' feModifyOrient: Spring/Damper orientation CSys
+
+    Dim app As femap.model
+    Dim prop As femap.Prop
+    Dim csys As femap.CSys
+    Dim rbe As femap.Elem
+    Dim node As femap.Node
+    Dim bush As femap.Elem
+    Dim newElements As femap.Set
+    Dim centers() As Long
+    Dim centerCount As Long
+    Dim createdIDs() As Long
+    Dim createdCount As Long
+    Dim propertyID As Long, csysID As Long
+    Dim centerID As Long, previousCenter As Long, bushID As Long
+    Dim i As Long, rc As Long, layerID As Long
+    Dim prompt As String, failure As String, remainingIDs As String
+    Dim direction(0 To 2) As Double
+    Dim directionArg As Variant
+
+    On Error GoTo ApiError
+    Set app = feFemap()
+    Set prop = app.feProp()
+
+    Do
+        rc = prop.SelectID("Select Spring/Damper property with Type = CBUSH")
+        If rc = FE_CANCEL Then Exit Sub
+        If rc <> FE_OK Then
+            MsgBox "Select an existing CBUSH property in the active model.", vbExclamation, ScriptTitle
+            Exit Sub
+        End If
+        If prop.Type = FET_L_SPRING Then Exit Do
+        MsgBox "Pick a Spring/Damper property whose Type is CBUSH.", vbExclamation, ScriptTitle
+    Loop
+    propertyID = prop.ID
+
+    Set csys = app.feCSys()
+    rc = csys.SelectID("Select CBUSH orientation CSys (0 = Basic Rectangular)")
+    If rc = FE_CANCEL Then Exit Sub
+    If rc <> FE_OK Then
+        MsgBox "Could not select a coordinate system (Femap code " & CStr(rc) & ").", vbExclamation, ScriptTitle
+        Exit Sub
+    End If
+    csysID = csys.ID
+
+    Set rbe = app.feElem()
+    Set node = app.feNode()
+    ReDim centers(1 To 32)
+
+    Do
+        prompt = "Pick RBE2 or RBE3 #" & CStr(centerCount + 1)
+        If centerCount >= 2 Then prompt = prompt & " (Cancel = create CBUSH chain)"
+        rc = rbe.SelectID(prompt)
+        If rc = FE_CANCEL Then Exit Do
+        If rc <> FE_OK Then
+            failure = "Element selection failed (Femap code " & CStr(rc) & ")."
+            GoTo Rollback
+        End If
+
+        centerID = ReferenceNodeID(rbe, node)
+        If centerID = 0 Then
+            MsgBox "Pick an RBE2 or RBE3 with a valid reference node.", vbExclamation, ScriptTitle
+        ElseIf centerID = previousCenter Then
+            MsgBox "The last selection uses node " & CStr(centerID) & ". Pick a different reference node.", _
+                vbExclamation, ScriptTitle
+        Else
+            If centerCount = UBound(centers) Then
+                ReDim Preserve centers(1 To 2 * centerCount)
+            End If
+            centerCount = centerCount + 1
+            centers(centerCount) = centerID
+            previousCenter = centerID
+        End If
+    Loop
+
+    If centerCount < 2 Then Exit Sub
+
+    Set bush = app.feElem()
+    Set newElements = app.feSet()
+    If newElements.ID <= 0 Then
+        failure = "Could not create the set for the new CBUSH elements."
+        GoTo Rollback
+    End If
+    ReDim createdIDs(1 To centerCount - 1)
+
+    bush.Type = FET_L_SPRING
+    bush.Topology = FTO_LINE2
+    bush.PropID = propertyID
+    layerID = app.Info_ActiveID(FT_LAYER)
+    If layerID > 0 Then bush.Layer = layerID
+    bush.Color = app.Info_Color(FT_ELEM)
+
+    For i = 1 To centerCount - 1
+        bush.Node(0) = centers(i)
+        bush.Node(1) = centers(i + 1)
+        bushID = bush.NextEmptyID()
+        If bushID <= 0 Then
+            failure = "Femap did not provide a new element ID."
+            GoTo Rollback
+        End If
+
+        rc = bush.Put(bushID)
+        If rc <> FE_OK Then
+            failure = "Could not create element " & CStr(bushID) & " (Femap code " & CStr(rc) & ")."
+            GoTo Rollback
+        End If
+        createdCount = createdCount + 1
+        createdIDs(createdCount) = bushID
+
+        rc = newElements.Add(bushID)
+        If rc <> FE_OK Then
+            failure = "Could not register new element " & CStr(bushID) & " for orientation."
+            GoTo Rollback
+        End If
+    Next i
+
+    ' Femap requires a vector argument. Method 5 uses the CSys ID for the orientation.
+    direction(0) = 1#
+    directionArg = direction
+    rc = app.feModifyOrient(newElements.ID, OrientByCSys, csysID, directionArg)
+    If rc <> FE_OK Then
+        failure = "Could not apply orientation CSys " & CStr(csysID) & " (Femap code " & CStr(rc) & ")." & _
+            vbCrLf & "Check that the selected Spring/Damper property's Type is CBUSH."
+        GoTo Rollback
+    End If
+
+    On Error Resume Next
+    Call app.feViewRegenerate(0)
+    MsgBox CStr(createdCount) & " CBUSH element(s) created. Property " & CStr(propertyID) & _
+        ", CSys " & CStr(csysID) & ".", vbInformation, ScriptTitle
+    Exit Sub
+
+ApiError:
+    failure = "Femap API error " & CStr(Err.Number) & ". " & Err.Description
+    Resume Rollback
+
+Rollback:
+    On Error Resume Next
+    For i = createdCount To 1 Step -1
+        rc = FE_FAIL
+        rc = bush.Delete(createdIDs(i))
+        If rc <> FE_OK Then remainingIDs = remainingIDs & " " & CStr(createdIDs(i))
+    Next i
+    If createdCount > 0 Then Call app.feViewRegenerate(0)
+    If Len(remainingIDs) > 0 Then
+        failure = failure & vbCrLf & "Check newly created element IDs" & remainingIDs & "."
+    End If
+    MsgBox failure, vbExclamation, ScriptTitle
+End Sub
+
+Private Function ReferenceNodeID(ByVal rbe As femap.Elem, ByVal node As femap.Node) As Long
+    Dim nodeID As Long
+
+    ' RBE2 and RBE3 use RigidList. RBE1 uses RigidList2.
+    If rbe.Type <> FET_L_RIGID Or rbe.Topology <> FTO_RIGIDLIST Then Exit Function
+    ' Node(0) is GN for RBE2 and REFGRID for RBE3.
+    nodeID = rbe.Node(0)
+    If nodeID <= 0 Then Exit Function
+    If node.Get(nodeID) = FE_OK Then ReferenceNodeID = nodeID
+End Function
