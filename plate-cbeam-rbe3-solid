@@ -1,0 +1,324 @@
+Option Explicit
+
+' FEMAP API - axial (global X) shell-to-solid glue connectors.
+' Select source SHELL nodes and actual target SOLID element faces.
+' The target is a planar/faceted surface; quadratic faces use corner geometry
+' for intersection, but ALL face nodes (including midsides) support the RBE3.
+' No existing entities are modified, moved, or deleted.
+' All lengths are in the current model's length units.
+' 이미 메쉬가 된 플레이트와 솔리드 필요. 메쉬가 된 플레이트를 먼저 선택하고 정확한 쉘과 솔리드사이에 거리를 입력할것. 그러면 rbe3과 cbeam이 만들어짐. 단 이건 x가 기준이므로 수저알것
+Sub Main
+    Dim app As femap.model
+    Set app = GetObject(, "femap.model")
+    Dim src As femap.Set, used As femap.Set, oldBeam As femap.Set
+    Dim pr As femap.Prop, el As femap.Elem, nd As femap.Node
+    Set src = app.feSet
+    Set used = app.feSet
+    Set oldBeam = app.feSet
+    Set pr = app.feProp
+    Set el = app.feElem
+    Set nd = app.feNode
+    Dim rc As Long, pid As Long, signX As Long
+    Dim ans As String, maxGap As Double, minGap As Double
+    Dim sourceCount As Long, faceCount As Long, i As Long, j As Long
+    Dim k As Long, n As Long, cornerCount As Long, eid As Long
+    Dim vElem As Variant, vFace As Variant, vNodes As Variant
+    Dim emptyIDs(0) As Long, emptyV As Variant
+    Dim fNode() As Long, fx() As Double, fy() As Double, fz() As Double
+    Dim fCount() As Long, fCorners() As Long
+    Dim lowY() As Double, hiY() As Double, lowZ() As Double, hiZ() As Double
+    Dim sID() As Long, sY() As Double, sZ() As Double
+    Dim hitFace() As Long, hitX() As Double
+    Dim x0 As Double, y0 As Double, z0 As Double, xx As Double
+    Dim gap As Double, bestGap As Double
+    Dim h As Boolean, dx As Double, bestFace As Long
+    Dim planned As Long, noHit As Long, already As Long, zeroGap As Long
+    Dim invalidFaces As Long, done As Long, nearMin As Double, nearMax As Double
+    Dim nid As Long, rid As Long, bid As Long
+    Dim stage As String, summary As String
+    On Error GoTo Failed
+
+    stage = "Select source nodes"
+    rc = src.Select(FT_NODE, True, "Select source PLATE nodes only")
+    If rc <> FE_OK Then Exit Sub
+    sourceCount = src.Count
+    If sourceCount = 0 Then Exit Sub
+
+    stage = "Select target solid element faces"
+    emptyV = emptyIDs
+    rc = app.feGetElementFaces("Select ONLY the target SOLID glue faces", 0, emptyV, emptyV, faceCount, vElem, vFace)
+    If rc <> FE_OK Then Exit Sub
+    If faceCount < 1 Then Exit Sub
+
+    stage = "Select existing glue beam property"
+    rc = pr.SelectID("Select existing BEAM (PBEAM/PBEAML) glue property")
+    If rc <> FE_OK Then Exit Sub
+    If pr.Type <> 5 Then
+        MsgBox "The property must have FEMAP BEAM type (5). No changes made.", vbExclamation
+        Exit Sub
+    End If
+    pid = pr.ID
+
+    ans = InputBox("Projection direction: enter +1 for +Global X, or -1 for -Global X.", "Glue direction", "-1")
+    If Trim$(ans) = "" Then Exit Sub
+    If ans = "1" Or ans = "+1" Then
+        signX = 1
+    ElseIf ans = "-1" Then
+        signX = -1
+    Else
+        MsgBox "Enter +1 or -1. No changes made.", vbExclamation
+        Exit Sub
+    End If
+    ans = InputBox("Maximum permitted beam length in MODEL UNITS. For a metre model, 0.005 = 5 mm.", "Maximum glue gap", "0.005")
+    If Trim$(ans) = "" Then Exit Sub
+    If Not IsNumeric(ans) Then
+        MsgBox "Invalid maximum gap. No changes made.", vbExclamation
+        Exit Sub
+    End If
+    maxGap = CDbl(ans)
+    If maxGap <= 0# Then Exit Sub
+    minGap = maxGap * 0.000001
+
+    ' Do not double-connect plate nodes already attached to the selected glue PID.
+    stage = "Scan existing glue beams"
+    rc = oldBeam.AddRule(pid, FGD_ELEM_BYPROP)
+    If rc <> FE_OK Then
+        ' An unused property may produce an empty result on some versions.
+        ' Fall back to an element-type search and filter by PID below.
+        rc = oldBeam.AddRule(5, FGD_ELEM_BYTYPE)
+        If rc <> FE_OK Then
+            rc = oldBeam.AddAll(FT_ELEM)
+            If rc <> FE_OK Then
+                MsgBox "Cannot scan existing glue elements. No changes made.", vbExclamation
+                Exit Sub
+            End If
+        End If
+    End If
+    rc = oldBeam.Reset
+    eid = oldBeam.Next
+    Do While eid > 0
+        If el.Get(eid) = FE_OK Then
+            If el.Type = 5 And el.PropID = pid Then
+                If el.Node(0) > 0 Then rc = used.Add(el.Node(0))
+                If el.Node(1) > 0 Then rc = used.Add(el.Node(1))
+            End If
+        End If
+        eid = oldBeam.Next
+    Loop
+
+    ' Cache target face vertices and node IDs before projecting any source nodes.
+    stage = "Read target element faces"
+    ReDim fNode(0 To 7, 0 To faceCount - 1)
+    ReDim fx(0 To 7, 0 To faceCount - 1)
+    ReDim fy(0 To 7, 0 To faceCount - 1)
+    ReDim fz(0 To 7, 0 To faceCount - 1)
+    ReDim fCount(0 To faceCount - 1)
+    ReDim fCorners(0 To faceCount - 1)
+    ReDim lowY(0 To faceCount - 1), hiY(0 To faceCount - 1)
+    ReDim lowZ(0 To faceCount - 1), hiZ(0 To faceCount - 1)
+    For i = 0 To faceCount - 1
+        If el.Get(CLng(vElem(i))) = FE_OK Then
+            Select Case el.Topology
+                Case 6, 7, 8, 10, 11, 12 ' solid tetra/wedge/brick only
+                    Call el.GetFaceNodes(CLng(vFace(i)), vNodes)
+                    n = 0
+                    For j = 0 To 7
+                        nid = CLng(vNodes(j))
+                        If nid > 0 Then
+                            If nd.Get(nid) <> FE_OK Then Err.Raise 1001, , "Cannot read face node " & CStr(nid)
+                            fNode(n, i) = nid
+                            fx(n, i) = nd.x
+                            fy(n, i) = nd.y
+                            fz(n, i) = nd.z
+                            n = n + 1
+                        End If
+                    Next j
+                    cornerCount = 0
+                    Select Case n
+                        Case 3, 6: cornerCount = 3
+                        Case 4, 8: cornerCount = 4
+                    End Select
+                    If cornerCount > 0 Then
+                        fCount(i) = n
+                        fCorners(i) = cornerCount
+                        lowY(i) = fy(0, i): hiY(i) = fy(0, i)
+                        lowZ(i) = fz(0, i): hiZ(i) = fz(0, i)
+                        For j = 1 To cornerCount - 1
+                            If fy(j, i) < lowY(i) Then lowY(i) = fy(j, i)
+                            If fy(j, i) > hiY(i) Then hiY(i) = fy(j, i)
+                            If fz(j, i) < lowZ(i) Then lowZ(i) = fz(j, i)
+                            If fz(j, i) > hiZ(i) Then hiZ(i) = fz(j, i)
+                        Next j
+                    End If
+            End Select
+        End If
+        If fCount(i) = 0 Then invalidFaces = invalidFaces + 1
+    Next i
+    If invalidFaces = faceCount Then
+        MsgBox "No supported solid element faces were selected. No changes made.", vbExclamation
+        Exit Sub
+    End If
+
+    ' Preflight (read-only). Save closest ray hit for each source node.
+    stage = "Project source nodes along global X"
+    ReDim sID(0 To sourceCount - 1), sY(0 To sourceCount - 1), sZ(0 To sourceCount - 1)
+    ReDim hitFace(0 To sourceCount - 1), hitX(0 To sourceCount - 1)
+    nearMin = maxGap
+    rc = src.Reset
+    nid = src.Next
+    k = 0
+    Do While nid > 0
+        sID(k) = nid
+        hitFace(k) = -1
+        If used.IsAdded(nid) = FE_OK Then
+            already = already + 1
+        Else
+            If nd.Get(nid) <> FE_OK Then Err.Raise 1002, , "Cannot read source node " & CStr(nid)
+            x0 = nd.x: y0 = nd.y: z0 = nd.z
+            sY(k) = y0: sZ(k) = z0
+            bestFace = -1: bestGap = maxGap + minGap
+            For i = 0 To faceCount - 1
+                If fCorners(i) > 0 Then
+                    If y0 >= lowY(i) - minGap And y0 <= hiY(i) + minGap And z0 >= lowZ(i) - minGap And z0 <= hiZ(i) + minGap Then
+                        h = TriangleX(y0, z0, fx(0, i), fy(0, i), fz(0, i), fx(1, i), fy(1, i), fz(1, i), fx(2, i), fy(2, i), fz(2, i), xx)
+                        If h Then
+                            dx = (xx - x0) * signX
+                            If dx >= -minGap And dx <= maxGap Then
+                                gap = Abs(dx)
+                                If gap < bestGap Then
+                                    bestGap = gap: bestFace = i: hitX(k) = xx
+                                End If
+                            End If
+                        End If
+                        If fCorners(i) = 4 Then
+                            h = TriangleX(y0, z0, fx(0, i), fy(0, i), fz(0, i), fx(2, i), fy(2, i), fz(2, i), fx(3, i), fy(3, i), fz(3, i), xx)
+                            If h Then
+                                dx = (xx - x0) * signX
+                                If dx >= -minGap And dx <= maxGap Then
+                                    gap = Abs(dx)
+                                    If gap < bestGap Then
+                                        bestGap = gap: bestFace = i: hitX(k) = xx
+                                    End If
+                                End If
+                            End If
+                        End If
+                    End If
+                End If
+            Next i
+            If bestFace < 0 Then
+                noHit = noHit + 1
+                Call app.feAppMessage(FCM_NORMAL, "Glue skipped: no suitable face for source node " & CStr(nid))
+            ElseIf bestGap <= minGap Then
+                zeroGap = zeroGap + 1
+                Call app.feAppMessage(FCM_NORMAL, "Glue skipped: zero gap at source node " & CStr(nid))
+            Else
+                hitFace(k) = bestFace
+                planned = planned + 1
+                If bestGap < nearMin Then nearMin = bestGap
+                If bestGap > nearMax Then nearMax = bestGap
+            End If
+        End If
+        k = k + 1
+        nid = src.Next
+    Loop
+
+    summary = "Source nodes: " & CStr(sourceCount) & vbCrLf & "Target faces: " & CStr(faceCount) & vbCrLf & _
+              "New connector pairs: " & CStr(planned) & vbCrLf & "Already connected (same PID): " & CStr(already) & vbCrLf & _
+              "No valid hit: " & CStr(noHit) & vbCrLf & "Zero-length gap: " & CStr(zeroGap) & vbCrLf & _
+              "Unsupported faces ignored: " & CStr(invalidFaces)
+    If planned = 0 Then
+        MsgBox summary & vbCrLf & "No entities created.", vbInformation
+        Exit Sub
+    End If
+    summary = summary & vbCrLf & "Beam length range: " & Format$(nearMin, "0.000000E+00") & " to " & Format$(nearMax, "0.000000E+00")
+    If MsgBox(summary & vbCrLf & vbCrLf & "Create nodes, RBE3s and CBEAMs?", vbYesNo + vbQuestion, "Glue preflight") <> vbYes Then Exit Sub
+
+    ' Create only after explicit confirmation; never overwrite existing IDs.
+    Dim refNode As femap.Node, rig As femap.Elem, beam As femap.Elem
+    Dim aIDs() As Long, aFaces() As Long, aWeight() As Double, aDOF() As Long
+    Dim vIDs As Variant, vFaces As Variant, vWeight As Variant, vDOF As Variant
+    For k = 0 To sourceCount - 1
+        i = hitFace(k)
+        If i >= 0 Then
+            nid = 0: rid = 0: bid = 0
+            stage = "Create reference node for plate node " & CStr(sID(k))
+            Set refNode = app.feNode
+            nid = refNode.NextEmptyID
+            refNode.x = hitX(k)
+            refNode.y = sY(k)
+            refNode.z = sZ(k)
+            refNode.defCSys = 0
+            refNode.outCSys = 0
+            refNode.Type = 0
+            If refNode.Put(nid) <> FE_OK Then Err.Raise 1003, , "Reference node Put failed"
+
+            stage = "Create RBE3 for plate node " & CStr(sID(k))
+            Set rig = app.feElem
+            rid = rig.NextEmptyID
+            rig.Type = 29
+            rig.Topology = 13
+            rig.RigidInterpolate = True
+            rig.RigidInterpolationFactor = 1#
+            rig.Node(0) = nid
+            For j = 0 To 5
+                rig.Release(0, j) = True
+            Next j
+            n = fCount(i)
+            ReDim aIDs(0 To n - 1), aFaces(0 To n - 1), aWeight(0 To n - 1), aDOF(0 To n * 6 - 1)
+            For j = 0 To n - 1
+                aIDs(j) = fNode(j, i)
+                aWeight(j) = 1#
+                aDOF(j * 6) = 1
+                aDOF(j * 6 + 1) = 1
+                aDOF(j * 6 + 2) = 1
+            Next j
+            vIDs = aIDs: vFaces = aFaces: vWeight = aWeight: vDOF = aDOF
+            If rig.PutNodeList(0, n, vIDs, vFaces, vWeight, vDOF) <> FE_OK Then Err.Raise 1004, , "RBE3 PutNodeList failed"
+            If rig.Put(rid) <> FE_OK Then Err.Raise 1005, , "RBE3 Put failed"
+
+            stage = "Create CBEAM for plate node " & CStr(sID(k))
+            Set beam = app.feElem
+            bid = beam.NextEmptyID
+            beam.Type = 5
+            beam.Topology = 0
+            beam.PropID = pid
+            beam.Node(0) = sID(k)
+            beam.Node(1) = nid
+            beam.OrientID = 0
+            beam.Orient(0) = 0#
+            beam.Orient(1) = 1#
+            beam.Orient(2) = 0#
+            If beam.Put(bid) <> FE_OK Then Err.Raise 1006, , "CBEAM Put failed"
+            done = done + 1
+            Call app.feAppMessage(FCM_NORMAL, "Glue: plate=" & CStr(sID(k)) & " reference=" & CStr(nid) & " RBE3=" & CStr(rid) & " CBEAM=" & CStr(bid))
+        End If
+    Next k
+    Call app.feViewRegenerate(0)
+    MsgBox "Created " & CStr(done) & " RBE3 + CBEAM pairs." & vbCrLf & summary, vbInformation, "Glue finished"
+    Exit Sub
+
+Failed:
+    MsgBox "Stopped at: " & stage & vbCrLf & Err.Description & vbCrLf & _
+           "Fully created pairs: " & CStr(done) & vbCrLf & "Current attempted IDs (node/RBE3/beam): " & CStr(nid) & "/" & CStr(rid) & "/" & CStr(bid) & vbCrLf & _
+           "Some new entities may exist. Inspect the Messages window and restore your saved model if needed.", vbCritical, "Glue macro stopped"
+End Sub
+
+' Intersect an X-parallel line with a planar triangle. Solve barycentric
+' coordinates in YZ, so there is no projection outside the triangle.
+Private Function TriangleX(ByVal y0 As Double, ByVal z0 As Double, ByVal ax As Double, ByVal ay As Double, ByVal az As Double, ByVal bx As Double, ByVal by As Double, ByVal bz As Double, ByVal cx As Double, ByVal cy As Double, ByVal cz As Double, ByRef xHit As Double) As Boolean
+    Dim uy As Double, uz As Double, vy As Double, vz As Double
+    Dim qy As Double, qz As Double, det As Double, detScale As Double
+    Dim u As Double, v As Double
+    uy = by - ay: uz = bz - az
+    vy = cy - ay: vz = cz - az
+    qy = y0 - ay: qz = z0 - az
+    det = uy * vz - uz * vy
+    detScale = Sqr((uy * uy + uz * uz) * (vy * vy + vz * vz))
+    If detScale <= 0# Then Exit Function
+    If Abs(det) <= 0.000000000001 * detScale Then Exit Function
+    u = (qy * vz - qz * vy) / det
+    v = (uy * qz - uz * qy) / det
+    If u < -0.00000001 Or v < -0.00000001 Or u + v > 1.00000001 Then Exit Function
+    xHit = ax + u * (bx - ax) + v * (cx - ax)
+    TriangleX = True
+End Function
