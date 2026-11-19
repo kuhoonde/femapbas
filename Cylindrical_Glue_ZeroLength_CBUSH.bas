@@ -23,7 +23,7 @@ Const PI As Double = 3.14159265358979
 Sub Main
     Dim App As femap.model
     Set App = GetObject(, "femap.model")
-    Dim inner As femap.Set, outer As femap.Set, props As femap.Set
+    Dim inner As femap.Set, outer As femap.Set, props As femap.Set, swapSet As femap.Set
     Set inner = App.feSet
     Set outer = App.feSet
     Set props = App.feSet
@@ -36,22 +36,28 @@ Sub Main
     Dim ringCenter As Variant, d As Variant, u As Variant, midXYZ As Variant
     Dim xPoint As Variant, yPoint As Variant, checkA As Variant, checkB As Variant
     Dim innerIDs As Variant, innerXYZ As Variant, outerIDs As Variant, outerXYZ As Variant
-    Dim innerPolar As Variant, outerPolar As Variant
+    Dim innerPolar As Variant, outerPolar As Variant, swapArray As Variant
     Dim planIn() As Variant, planOut() As Variant, planMid() As Variant, planU() As Variant
     Dim nIn As Long, nOut As Long, n As Long, i As Long, k As Long, pid As Long, rc As Long
     Dim sid As Long, rIn As Double, rOut As Double, diameter As Double, h As Double
-    Dim theta As Double, rMid As Double, eps As Double, numericCount As Double
-    Dim s As String, stage As String, why As String, msg As String
+    Dim theta As Double, rMid As Double, numericCount As Double, swapRadius As Double
+    Dim swapCount As Long, aIDs As String, bIDs As String, innerLabel As String, outerLabel As String
+    Dim s As String, stage As String, why As String, msg As String, orderText As String
     Dim occupied As Object, planned As Object, testNodes As Variant
     Dim nCreated As Long, eCreated As Long, cCreated As Long, done As Long
     Dim nodeA As Long, nodeB As Long, cid As Long, eid As Long
     Dim creating As Boolean
     On Error GoTo RuntimeError
 
-    If inner.Select(FT_SURFACE, True, "INNER part: select outward cylindrical attachment surface(s)") <> FE_OK Then Exit Sub
+    If inner.Select(FT_SURFACE, True, "Side A: select cylindrical attachment surface(s) on first part") <> FE_OK Then Exit Sub
     If inner.Count = 0 Then Exit Sub
-    If outer.Select(FT_SURFACE, True, "OUTER part: select inward cylindrical attachment surface(s)") <> FE_OK Then Exit Sub
+    If outer.Select(FT_SURFACE, True, "Side B: select opposing cylindrical attachment surface(s) on second part") <> FE_OK Then Exit Sub
     If outer.Count = 0 Then Exit Sub
+    aIDs = SurfaceIDs(inner)
+    bIDs = SurfaceIDs(outer)
+    rc = App.feAppMessage(FCM_NORMAL, "--- CYLINDRICAL GLUE V2: selected surfaces (no changes) ---")
+    rc = App.feAppMessage(FCM_NORMAL, "Side A Surface IDs: " & aIDs)
+    rc = App.feAppMessage(FCM_NORMAL, "Side B Surface IDs: " & bIDs)
     rc = inner.Reset
     sid = inner.Next
     stage = "Extracting cylinder axis from Surface " & CStr(sid)
@@ -64,6 +70,7 @@ Sub Main
         If Abs(CDbl(axis(i))) > Abs(CDbl(axis(k))) Then k = i
     Next i
     If CDbl(axis(k)) < 0# Then axis = ScaleV(axis, -1#)
+    rc = App.feAppMessage(FCM_NORMAL, "Reference axis base=" & VecText(axisBase) & "; direction=" & VecText(axis))
 
     stage = "Picking first glue center"
     If App.feCoordPick("First glue center: desired height and angle (pick point/node or enter XYZ)", first) <> FE_OK Then Exit Sub
@@ -107,17 +114,49 @@ Sub Main
         "Confirm its Type is CBUSH (NOT Other or CBUSH1D), with your K1-K6." & vbCrLf & _
         "The property will not be modified.", vbYesNo Or vbQuestion Or vbDefaultButton2, "Check CBUSH property") <> vbYes Then Exit Sub
 
-    stage = "Reading inner surface solid faces and cylinder radius"
+    stage = "Reading Side A solid faces and cylinder radius"
     rc = App.feAppMessage(FCM_NORMAL, "--- CYLINDRICAL GLUE PREVIEW (no model changes) ---")
     If Not CollectSide(App, inner, axisBase, axis, innerIDs, innerXYZ, nIn, rIn, why) Then GoTo Rejected
-    stage = "Reading outer surface solid faces and cylinder radius"
+    rc = App.feAppMessage(FCM_NORMAL, "SIDE A radius=" & CStr(rIn) & "; Surface IDs=" & aIDs)
+    stage = "Reading Side B solid faces and cylinder radius"
     If Not CollectSide(App, outer, axisBase, axis, outerIDs, outerXYZ, nOut, rOut, why) Then GoTo Rejected
-    eps = 0.000001 * (1# + rOut + rIn)
-    If rOut < rIn - eps Then
-        why = "Outer radius is smaller than inner radius. Reselect in correct order."
-        GoTo Rejected
-    End If
+    rc = App.feAppMessage(FCM_NORMAL, "SIDE B radius=" & CStr(rOut) & "; Surface IDs=" & bIDs)
+    rc = App.feAppMessage(FCM_NORMAL, "Signed radius difference B-A=" & CStr(rOut - rIn))
     If rIn <= 0# Or rOut <= 0# Then GoTo Rejected
+    stage = "Checking selected cylinder order"
+    innerLabel = aIDs
+    outerLabel = bIDs
+    orderText = "A=inner, B=outer"
+    If rOut < rIn Then
+        rc = App.feAppMessage(FCM_NORMAL, "Selection order reversed: B has the smaller radius. Proposed inner=B; outer=A.")
+        msg = "Side A radius: " & CStr(rIn) & vbCrLf & _
+            "Side B radius: " & CStr(rOut) & vbCrLf & _
+            "Absolute gap: " & CStr(rIn - rOut) & vbCrLf & _
+            "Side B will become inner; Side A will become outer." & vbCrLf & _
+            "Confirm these are the intended opposing glue faces (not another step or interference)." & vbCrLf & _
+            "No = stop without model changes."
+        If MsgBox(msg, vbYesNo Or vbQuestion Or vbDefaultButton2, "Reverse radius order?") <> vbYes Then Exit Sub
+        swapRadius = rIn
+        rIn = rOut
+        rOut = swapRadius
+        swapCount = nIn
+        nIn = nOut
+        nOut = swapCount
+        swapArray = innerIDs
+        innerIDs = outerIDs
+        outerIDs = swapArray
+        swapArray = innerXYZ
+        innerXYZ = outerXYZ
+        outerXYZ = swapArray
+        Set swapSet = inner
+        Set inner = outer
+        Set outer = swapSet
+        innerLabel = bIDs
+        outerLabel = aIDs
+        orderText = "B=inner, A=outer (reversed)"
+    End If
+    rc = App.feAppMessage(FCM_NORMAL, "FINAL order: " & orderText)
+    rc = App.feAppMessage(FCM_NORMAL, "FINAL inner Surface IDs=" & innerLabel & "; outer Surface IDs=" & outerLabel)
     If diameter >= PI * rIn Then
         why = "Glue diameter too large for this cylinder."
         GoTo Rejected
@@ -130,6 +169,7 @@ Sub Main
     End If
     rMid = (rIn + rOut) / 2#
     rc = App.feAppMessage(FCM_NORMAL, "Inner radius=" & CStr(rIn) & "; outer radius=" & CStr(rOut) & "; gap=" & CStr(rOut - rIn))
+    rc = App.feAppMessage(FCM_NORMAL, "CBUSH midpoint radius=" & CStr(rMid))
     rc = App.feAppMessage(FCM_NORMAL, "Axis=" & VecText(axis) & "; row center=" & VecText(ringCenter))
     rc = App.feAppMessage(FCM_NORMAL, "Surface nodes: inner=" & CStr(nIn) & ", outer=" & CStr(nOut))
     rc = App.feAppMessage(FCM_NORMAL, "Diameter=" & CStr(diameter) & "; pitch=" & CStr(360# / n) & " degrees; Property=" & CStr(pid))
@@ -162,9 +202,11 @@ Sub Main
     Next i
     rc = App.feAppMessage(FCM_NORMAL, "PREVIEW OK: " & CStr(2 * n) & " nodes, " & CStr(2 * n) & " RBE2, " & CStr(n) & " CBUSH, " & CStr(n) & " coordinate systems.")
     msg = "Create " & CStr(n) & " zero-length CBUSH connections?" & vbCrLf & _
+        "Surface order: " & orderText & vbCrLf & _
         "Inner diameter: " & CStr(2# * rIn) & vbCrLf & _
         "Outer diameter: " & CStr(2# * rOut) & vbCrLf & _
         "Gap: " & CStr(rOut - rIn) & vbCrLf & _
+        "CBUSH radius: " & CStr(rMid) & vbCrLf & _
         "Glue diameter: " & CStr(diameter) & vbCrLf & _
         "K1: inward, K2: tangent, K3: cylinder axis." & vbCrLf & _
         "RBE2 dependent DOFs: 123 (solid mesh)." & vbCrLf & _
@@ -283,6 +325,19 @@ ReportError:
     End If
 End Sub
 
+' Preserve original side labels for diagnostics and final confirmation.
+Function SurfaceIDs(ss As femap.Set) As String
+    Dim rc As Long, sid As Long, s As String
+    rc = ss.Reset
+    sid = ss.Next
+    Do While sid > 0
+        If Len(s) > 0 Then s = s & ", "
+        s = s & CStr(sid)
+        sid = ss.Next
+    Loop
+    SurfaceIDs = s
+End Function
+
 ' Collect solid face nodes and validate revolution axis/radius of every surface.
 Function CollectSide(App As femap.model, faces As femap.Set, axisBase As Variant, axis As Variant, ids As Variant, xyz As Variant, count As Long, radius As Double, why As String) As Boolean
     Dim sf As femap.Surface, el As femap.Elem, nd As femap.Node, nodes As femap.Set
@@ -294,6 +349,8 @@ Function CollectSide(App As femap.model, faces As femap.Set, axisBase As Variant
     Dim ef As Variant, fi As Variant, fn As Variant, good As Variant
     Dim b As Variant, a As Variant, diff As Variant, point As Variant, projected As Variant, v As Variant
     Dim r As Double, tol As Double, stepF As Long, f As Long, nsample As Long
+    Dim rawR As Double, rawMin As Double, rawMax As Double, cadMin As Double, cadMax As Double
+    Dim rawCount As Long, surfaceCount As Long, axisOffset As Double
     rc = faces.Reset
     sid = faces.Next
     Do While sid > 0
@@ -306,7 +363,9 @@ Function CollectSide(App As femap.model, faces As femap.Set, axisBase As Variant
         a = ScaleV(a, 1# / LengthOf(a))
         diff = SubV(b, axisBase)
         diff = SubV(diff, ScaleV(axis, DotV(diff, axis)))
-        If Abs(DotV(a, axis)) < 0.99999999 Or LengthOf(diff) > 0.00001 * (1# + radius) Then
+        axisOffset = LengthOf(diff)
+        rc = App.feAppMessage(FCM_NORMAL, "Surface " & CStr(sid) & " axis base=" & VecText(b) & "; direction=" & VecText(a) & "; axis offset=" & CStr(axisOffset))
+        If Abs(DotV(a, axis)) < 0.99999999 Or axisOffset > 0.00001 * (1# + radius) Then
             why = why & ": cylinder axes are not concentric."
             Exit Function
         End If
@@ -318,6 +377,12 @@ Function CollectSide(App As femap.model, faces As femap.Set, axisBase As Variant
             Exit Function
         End If
         rc = App.feAppMessage(FCM_NORMAL, why & ": " & CStr(nf) & " solid faces")
+        rawMin = 1.0E+30
+        rawMax = 0#
+        cadMin = 1.0E+30
+        cadMax = 0#
+        rawCount = 0
+        surfaceCount = 0
         stepF = nf \ 12
         If stepF < 1 Then stepF = 1
         For f = 0 To nf - 1
@@ -333,14 +398,28 @@ Function CollectSide(App As femap.model, faces As femap.Set, axisBase As Variant
                     nid = CLng(fn(k))
                     If nid > 0 Then
                         If App.feCoordOnNode(nid, point) <> FE_OK Then Exit Function
+                        If k < 3 Then
+                            v = SubV(point, axisBase)
+                            v = SubV(v, ScaleV(axis, DotV(v, axis)))
+                            rawR = LengthOf(v)
+                            If rawR < rawMin Then rawMin = rawR
+                            If rawR > rawMax Then rawMax = rawR
+                            rawCount = rawCount + 1
+                        End If
                         If App.feCoordOntoSurface(sid, point, projected) <> FE_OK Then Exit Function
                         v = SubV(projected, axisBase)
                         v = SubV(v, ScaleV(axis, DotV(v, axis)))
                         r = LengthOf(v)
                         If r <= 0.000000001 Then Exit Function
+                        If r < cadMin Then cadMin = r
+                        If r > cadMax Then cadMax = r
+                        surfaceCount = surfaceCount + 1
                         If nsample = 0 Then radius = r
                         tol = 0.00001 * (1# + radius)
                         If Abs(r - radius) > tol Then
+                            rc = App.feAppMessage(FCM_NORMAL, "RADIUS MISMATCH: Surface " & CStr(sid) & "; expected=" & CStr(radius) & "; projected=" & CStr(r) & "; sample node=" & CStr(nid))
+                            rc = App.feAppMessage(FCM_NORMAL, "Current Surface CAD samples min/max=" & CStr(cadMin) & " / " & CStr(cadMax))
+                            If rawCount > 0 Then rc = App.feAppMessage(FCM_NORMAL, "Current Surface mesh corner radii min/max=" & CStr(rawMin) & " / " & CStr(rawMax))
                             why = why & ": sampled CAD radii vary. Select cylindrical faces of one radius only."
                             Exit Function
                         End If
@@ -349,6 +428,13 @@ Function CollectSide(App As femap.model, faces As femap.Set, axisBase As Variant
                 Next k
             End If
         Next f
+        If surfaceCount > 0 Then rc = App.feAppMessage(FCM_NORMAL, "Surface " & CStr(sid) & " CAD projected radius min/max=" & CStr(cadMin) & " / " & CStr(cadMax))
+        If rawCount > 0 Then rc = App.feAppMessage(FCM_NORMAL, "Surface " & CStr(sid) & " mesh corner radius min/max=" & CStr(rawMin) & " / " & CStr(rawMax))
+        If surfaceCount > 0 And rawCount > 0 Then
+            If Abs(cadMax - rawMax) > 0.00001 * (1# + radius) Then
+                rc = App.feAppMessage(FCM_NORMAL, "WARNING: CAD projection and mesh corner radii differ. Verify selected Surface and mesh association before creating.")
+            End If
+        End If
         sid = faces.Next
     Loop
     count = nodes.Count
